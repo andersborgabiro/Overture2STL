@@ -10,7 +10,13 @@ This is working code, that has generated consistent results for me, but still ea
 
 Install the dependencies listed in requirements.txt.
 
-For CLI: Use https://boundingbox.klokantech.com/ to select the area to generate an STL for. Select CSV for the output, that is then entered into Overture2STL-CLI.
+For Overture2STL-CLI:
+- Start with "python Overture2STL-CLI.py"
+- Use https://boundingbox.klokantech.com/ to select the area to generate an STL for. Select CSV for the output, that is then entered into Overture2STL-CLI.
+
+For Overture2STL-CLI-SL:
+- Start with "streamlit run Overture2STL-SL.py"
+- This variant has an integrated map that you use to select your area of interest.
 
 Downloading data takes a rather long time, but once downloaded for a certain area (based on the bounding box) the generated files will be re-used unless you delete them.
 
@@ -18,7 +24,7 @@ You adjust what types of data are included by adding to or removing from the Ove
 
 Some areas contain lots of more or less irrelevant points that Overture2Stl will render as small cylinders. To avoid them altogether set the point-related dimensions to 0.
 
-Be aware that STLs are dimension-less. Overture2Stl uses meters that all (?) slicers will treat as millimeters. Often that's good enough, but expect to have to scale down larger areas. Take that into account when you set the scaling factor and  different dimensions.
+Be aware that STLs are dimension-less. Overture2STL uses meters that all (?) slicers will treat as millimeters. Often that's good enough, but expect to have to scale down larger areas. Take that into account when you set the scaling factor and  different dimensions.
 
 Experiment / Iterate :)!
 
