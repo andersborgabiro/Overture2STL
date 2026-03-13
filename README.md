@@ -14,7 +14,7 @@ For Overture2STL-CLI:
 - Start with "python Overture2STL-CLI.py"
 - Use https://boundingbox.klokantech.com/ to select the area to generate an STL for. Select CSV for the output, that is then entered into Overture2STL-CLI.
 
-For Overture2STL-CLI-SL:
+For Overture2STL-SL:
 - Start with "streamlit run Overture2STL-SL.py"
 - This variant has an integrated map that you use to select your area of interest.
 
