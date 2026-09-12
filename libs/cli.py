@@ -18,7 +18,7 @@ import pyarrow.fs as fs
 import pyarrow.parquet as pq
 import shapely.wkb
 
-from .core import record_batch_reader, get_all_overture_types
+from .core import record_batch_reader
 
 
 def get_writer(output_format, path, schema):

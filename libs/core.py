@@ -1,19 +1,10 @@
-from typing import List, Optional
+import functools
+from typing import Optional
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.fs as fs
-
-# Allows for optional import of additional dependencies
-try:
-    import geopandas as gpd
-    from geopandas import GeoDataFrame
-
-    HAS_GEOPANDAS = True
-except ImportError:
-    HAS_GEOPANDAS = False
-    GeoDataFrame = None
 
 
 def record_batch_reader(overture_type, bbox=None) -> Optional[pa.RecordBatchReader]:
@@ -49,29 +40,6 @@ def record_batch_reader(overture_type, bbox=None) -> Optional[pa.RecordBatchRead
     geoarrow_schema = geoarrow_schema_adapter(dataset.schema)
     reader = pa.RecordBatchReader.from_batches(geoarrow_schema, non_empty_batches)
     return reader
-
-
-def geodataframe(
-    overture_type: str, bbox: (float, float, float, float) = None
-) -> GeoDataFrame:
-    """
-    Loads geoparquet for specified type into a geopandas dataframe
-
-    Parameters
-    ----------
-    overture_type: type to load
-    bbox: optional bounding box for data fetch (xmin, ymin, xmax, ymax)
-
-    Returns
-    -------
-    GeoDataFrame with the optionally filtered theme data
-
-    """
-    if not HAS_GEOPANDAS:
-        raise ImportError("geopandas is required to use this function")
-
-    reader = record_batch_reader(overture_type, bbox)
-    return gpd.GeoDataFrame.from_arrow(reader)
 
 
 def geoarrow_schema_adapter(schema: pa.Schema) -> pa.Schema:
@@ -121,6 +89,46 @@ type_theme_map = {
 }
 
 
+# Last known-good release, used only as a fallback if the release listing
+# below ever fails (e.g. the S3 "list" API is unreachable while "get" still
+# works). Safe to leave stale since it's not the normal code path.
+_FALLBACK_RELEASE = "2026-07-22.0"
+
+
+@functools.lru_cache(maxsize=1)
+def _latest_release() -> str:
+    """
+    Discover the most recent Overture release folder available in the public
+    S3 bucket (releases are published as top-level "release/<date>.<n>/"
+    prefixes), so this doesn't need to be hardcoded and bumped by hand every
+    time Overture publishes a new one. Cached for the life of the process,
+    since it doesn't change during a single run and every call would
+    otherwise re-list the bucket.
+    """
+    try:
+        s3 = fs.S3FileSystem(anonymous=True, region="us-west-2")
+        infos = s3.get_file_info(
+            fs.FileSelector("overturemaps-us-west-2/release", recursive=False)
+        )
+        releases = [
+            info.path.rsplit("/", 1)[-1]
+            for info in infos
+            if info.type == fs.FileType.Directory
+        ]
+        if not releases:
+            raise RuntimeError("No release folders found in the S3 bucket.")
+
+        def sort_key(release_name):
+            date_part, _, minor_part = release_name.partition(".")
+            return (date_part, int(minor_part) if minor_part.isdigit() else 0)
+
+        return max(releases, key=sort_key)
+    except Exception as e:
+        print(f"Could not determine latest Overture release, falling back to "
+              f"'{_FALLBACK_RELEASE}': {e}")
+        return _FALLBACK_RELEASE
+
+
 def _dataset_path(overture_type: str) -> str:
     """
     Returns the s3 path of the Overture dataset to use. This assumes overture_type has
@@ -131,10 +139,5 @@ def _dataset_path(overture_type: str) -> str:
     # complete s3 path. Could be discovered by reading from the top-level s3
     # location but this allows to only read the files in the necessary partition.
     theme = type_theme_map[overture_type]
-    #return f"overturemaps-us-west-2/release/2025-03-19.0/theme={theme}/type={overture_type}/"
-    #return f"overturemaps-us-west-2/release/2025-05-21.0/theme={theme}/type={overture_type}/"
-    return f"overturemaps-us-west-2/release/2026-01-21.0/theme={theme}/type={overture_type}/"
-
-
-def get_all_overture_types() -> List[str]:
-    return list(type_theme_map.keys())
+    release = _latest_release()
+    return f"overturemaps-us-west-2/release/{release}/theme={theme}/type={overture_type}/"
