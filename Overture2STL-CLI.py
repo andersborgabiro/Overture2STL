@@ -1,21 +1,54 @@
+import os
+import sys
+import traceback
+
 from libs.Overture2STL import (
     bbox_size_meters,
     map_types_default,
     map_types_all,
     overture_to_stl,
+    validate_output_filename,
+    make_session_dir,
+    cleanup_old_cache_files,
+    DEFAULT_GEOJSON_CACHE_DIR,
+    DEFAULT_OUTPUT_ROOT_DIR,
+    DEFAULT_CACHE_MAX_AGE_SECONDS,
+    DEFAULT_AREA_WARNING_THRESHOLD_M2,
 )
 
 if __name__ == "__main__":
+    cleanup_old_cache_files(DEFAULT_GEOJSON_CACHE_DIR, DEFAULT_CACHE_MAX_AGE_SECONDS)
+
     # Bounding box
     input_bbox = input(
         "Enter bounding box (long west, lat south, long east, lat north): "
     ).strip()
-    bbox = [round(float(x.strip()), 6) for x in input_bbox.split(",")]
+    try:
+        bbox = [round(float(x.strip()), 6) for x in input_bbox.split(",")]
+    except ValueError:
+        print("Bounding box must be 4 comma-separated numbers.")
+        sys.exit(1)
+    if len(bbox) != 4:
+        print(f"Bounding box must have exactly 4 comma-separated numbers (got {len(bbox)}).")
+        sys.exit(1)
 
     width_m, height_m = bbox_size_meters(bbox)
     print(
         f"Given the provided bounding box, the dimensions of the area are roughly {round(width_m, 0)} m wide and {round(height_m, 0)} m high. Take this into account when editing object dimensions and scaling."
     )
+
+    area_m2 = width_m * height_m
+    if area_m2 > DEFAULT_AREA_WARNING_THRESHOLD_M2:
+        confirm = input(
+            f"This area is approximately {area_m2 / 1_000_000:.2f} km² "
+            f"({area_m2:,.0f} m²), above the recommended limit of "
+            f"{DEFAULT_AREA_WARNING_THRESHOLD_M2 / 1_000_000:.1f} km². "
+            "Generating an STL for an area this large can take a long time "
+            "and use significant memory. Continue? [y/N]: "
+        ).strip().lower()
+        if confirm != "y":
+            print("Cancelled.")
+            sys.exit(0)
 
     # Overture types
     types_list = ", ".join(map_types_default)
@@ -130,7 +163,15 @@ if __name__ == "__main__":
         "File name for generated files without extension: "
     ).strip()
 
-    if input_outputfile != "":
+    filename_error = validate_output_filename(input_outputfile)
+    if filename_error:
+        print(filename_error)
+        sys.exit(1)
+
+    try:
+        session_dir = make_session_dir(DEFAULT_OUTPUT_ROOT_DIR)
+        output_stl_path = os.path.join(session_dir, input_outputfile)
+
         overture_to_stl(
             bbox,
             overture_types,
@@ -144,7 +185,26 @@ if __name__ == "__main__":
             scale_percent,
             base_margin,
             base_height,
-            input_outputfile,
+            output_stl_path,
         )
-    else:
-        print("Missing a file path!")
+        print(f"'{input_outputfile}.stl' was generated successfully (saved under '{session_dir}').")
+    except OSError as e:
+        print(
+            f"Could not write output files for '{input_outputfile}': {e}\n"
+            "Check that the file name is valid and that you have write access to the working directory."
+        )
+        sys.exit(1)
+    except ValueError as e:
+        print(
+            f"No usable data to build from: {e}\n"
+            "Try a larger bounding box, a different combination of map types, "
+            "or verify that Overture data is available for this area."
+        )
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"Mesh generation failed: {e}")
+        sys.exit(1)
+    except Exception:
+        print("Something went wrong when generating the STL file:")
+        traceback.print_exc()
+        sys.exit(1)

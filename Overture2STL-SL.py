@@ -1,9 +1,14 @@
 # TODO Separate bounding box for STL from bounding box for map (completely separate)
 
+import os
+import traceback
+
 import streamlit as st
 from streamlit_folium import st_folium
 import folium
 from folium.plugins import Draw
+from branca.element import MacroElement
+from folium.template import Template
 
 from libs.Overture2STL import (
     bbox_string,
@@ -11,9 +16,25 @@ from libs.Overture2STL import (
     map_types_default,
     map_types_all,
     overture_to_stl,
+    validate_output_filename,
+    make_session_dir,
+    cleanup_old_cache_files,
+    DEFAULT_GEOJSON_CACHE_DIR,
+    DEFAULT_OUTPUT_ROOT_DIR,
+    DEFAULT_CACHE_MAX_AGE_SECONDS,
+    DEFAULT_AREA_WARNING_THRESHOLD_M2,
 )
 
+# Run once per browser session (i.e. on page load), not on every rerun
+# triggered by widget interactions, since scanning the cache is unnecessary
+# I/O to repeat on every click.
+if "cache_cleanup_done" not in st.session_state:
+    cleanup_old_cache_files(DEFAULT_GEOJSON_CACHE_DIR, DEFAULT_CACHE_MAX_AGE_SECONDS)
+    st.session_state["cache_cleanup_done"] = True
+
+
 # Must be called first
+# TODO Consider layout="wide"
 st.set_page_config(page_title="Overture to STL", page_icon="🗺", layout="centered", initial_sidebar_state="collapsed")
 
 st.title("🗺 Overture to STL Generator")
@@ -41,23 +62,35 @@ st.markdown(custom_css, unsafe_allow_html=True)
 st.header("Bounding Box")
 
 st.write(
-    "Draw a rectangle on the map to select the area. You can zoom and pan as needed. Only one rectangle is allowed at a time."
+    "Draw a rectangle on the map to select the area. You can zoom and pan as needed. Drawing a new rectangle replaces the previous one."
 )
 
 # Initialize session state for bbox
 if "bbox" not in st.session_state:
-    bbox = [13.133869, 55.675416, 13.267422, 55.744661]  # Lund, Sweden
-    st.session_state["bbox"] = bbox
-else:
-    bbox = st.session_state["bbox"]
+    st.session_state["bbox"] = [13.133869, 55.675416, 13.267422, 55.744661]  # Lund, Sweden
+bbox = st.session_state["bbox"]
 
-# Center map on current bbox
-center_lat = (bbox[1] + bbox[3]) / 2
-center_lon = (bbox[0] + bbox[2]) / 2
+# The map's initial location must never change across reruns: streamlit-folium
+# fingerprints the map's own init script to decide whether to remount it, and
+# any change (e.g. re-centering on the freshly drawn bbox) makes it look like
+# a different map and forces a full remount, wiping any drawn shapes. So this
+# is computed once and frozen. There's no need to feed the user's live pan/zoom
+# back into the map afterwards: as long as it isn't remounted, the browser-side
+# Leaflet map keeps its own view state on its own between reruns. (Doing so was
+# tried and reverted: the center computed from returned bounds is a flat
+# lat/lng average, which isn't quite the same point Leaflet reports as the
+# true center under its Mercator projection, so re-applying it every rerun
+# made the map nudge itself, re-triggering another rerun in an endless loop.)
+if "initial_view" not in st.session_state:
+    st.session_state["initial_view"] = {
+        "center": [(bbox[1] + bbox[3]) / 2, (bbox[0] + bbox[2]) / 2],
+        "zoom": 14,
+    }
+initial_view = st.session_state["initial_view"]
 
 m = folium.Map(
-    location=[center_lat, center_lon],
-    zoom_start=14,
+    location=initial_view["center"],
+    zoom_start=initial_view["zoom"],
     tiles="OpenStreetMap",
     width="100%",
     height=500,
@@ -75,6 +108,31 @@ Draw(
     },
     edit_options={"edit": True, "remove": True},
 ).add_to(m)
+
+
+# Force a single rectangle: whenever a new one is drawn, remove any other
+# shapes from the Draw plugin's own layer group so only the latest remains.
+# streamlit-folium renames the map and the Draw plugin's layer group to the
+# fixed names "map_div" and "drawnItems" in the script it sends to the
+# browser, so this must be added as a real script-macro child of the map
+# (not injected as raw HTML) and reference those fixed names directly.
+class SingleRectangleEnforcer(MacroElement):
+    _template = Template(
+        """
+        {% macro script(this, kwargs) %}
+        map_div.on('draw:created', function (e) {
+            drawnItems.eachLayer(function (layer) {
+                if (layer !== e.layer) {
+                    drawnItems.removeLayer(layer);
+                }
+            });
+        });
+        {% endmacro %}
+        """
+    )
+
+
+SingleRectangleEnforcer().add_to(m)
 
 map_data = st_folium(m, height=500, width="100%")
 
@@ -184,14 +242,18 @@ with col3:
     )
 
 # --- Output File ---
+
 st.header("Output")
 outputfile = st.text_input(
     "File name for generated files (without extension)", value=""
 )
 
-if "perform" in st.session_state and st.session_state["perform"]:   
-    with st.spinner("Generating STL...", show_time=True):
+if "perform" in st.session_state and st.session_state["perform"]:
+    with st.status("Generating STL...", expanded=True) as status:
         try:
+            session_dir = make_session_dir(DEFAULT_OUTPUT_ROOT_DIR)
+            output_stl_path = os.path.join(session_dir, outputfile)
+
             overture_to_stl(
                 bbox,
                 selected_types,
@@ -205,25 +267,92 @@ if "perform" in st.session_state and st.session_state["perform"]:
                 scale_percent,
                 base_margin,
                 base_height,
-                outputfile,
+                output_stl_path,
+                progress_callback=status.write,
             )
 
-            st.success(f"'{outputfile}.stl' was generated successfully.")
-            st.info("Check your working directory for the file.")
-        except Exception as e:
-            st.error(f"Something went wrong when generating the STL file: {e}")
+            with open(f"{output_stl_path}.stl", "rb") as stl_file:
+                # Stored in session_state (not just rendered here) because
+                # st.download_button triggers its own rerun when clicked, and
+                # that rerun no longer has "perform" set, so a button rendered
+                # only inside this block would disappear on the very click
+                # meant to use it.
+                st.session_state["last_stl"] = {
+                    "filename": f"{outputfile}.stl",
+                    "data": stl_file.read(),
+                }
 
-        st.session_state["perform"] = False 
+            status.update(label="STL generated successfully", state="complete", expanded=False)
+            st.success(f"'{outputfile}.stl' was generated successfully (saved under '{session_dir}').")
+        except OSError as e:
+            status.update(label="STL generation failed", state="error")
+            st.error(
+                f"Could not write output files for '{outputfile}': {e}\n\n"
+                "Check that the file name is valid and that you have write access to the working directory."
+            )
+        except ValueError as e:
+            status.update(label="STL generation failed", state="error")
+            st.error(
+                f"No usable data to build from: {e}\n\n"
+                "Try a larger bounding box, a different combination of map types, "
+                "or verify that Overture data is available for this area."
+            )
+        except RuntimeError as e:
+            status.update(label="STL generation failed", state="error")
+            st.error(f"Mesh generation failed: {e}")
+        except Exception as e:
+            status.update(label="STL generation failed", state="error")
+            st.error(f"Something went wrong when generating the STL file: {e}")
+            with st.expander("Show error details"):
+                st.code(traceback.format_exc())
+
+        st.session_state["perform"] = False
+
+@st.dialog("Large area selected")
+def confirm_large_area(area_m2):
+    st.write(
+        f"The selected area is approximately **{area_m2 / 1_000_000:.2f} km²** "
+        f"({area_m2:,.0f} m²), above the recommended limit of "
+        f"{DEFAULT_AREA_WARNING_THRESHOLD_M2 / 1_000_000:.1f} km². Generating an STL "
+        "for an area this large can take a long time and use significant memory."
+    )
+    cancel_col, continue_col = st.columns(2)
+    with cancel_col:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+    with continue_col:
+        if st.button("Continue", type="primary", use_container_width=True):
+            st.session_state["perform"] = True
+            st.rerun()
+
 
 # --- Generate STL Button ---
 if st.button("Generate STL"):
-    if not outputfile.strip():
-        st.error("Please enter a file name for the output.")
+    filename_error = validate_output_filename(outputfile)
+    if filename_error:
+        st.error(filename_error)
     elif not bbox or len(bbox) != 4:
         st.error("Please select a bounding box on the map.")
     elif not selected_types:
         st.error("Please select at least one map type.")
     else:
-        st.session_state["perform"] = True     
+        area_m2 = width_m * height_m
+        if area_m2 > DEFAULT_AREA_WARNING_THRESHOLD_M2:
+            confirm_large_area(area_m2)
+        else:
+            st.session_state["perform"] = True
+            # The generation-check block above runs before this button in
+            # script order, so without forcing an immediate rerun here, this
+            # click's flag would only be picked up on the *next* unrelated
+            # interaction (i.e. the button would seem to need two presses).
+            st.rerun()
 
-st.caption("Powered by Overture2STL by Abiro 2025, licensed under the MIT License.")
+if "last_stl" in st.session_state:
+    st.download_button(
+        label=f"Download {st.session_state['last_stl']['filename']}",
+        data=st.session_state["last_stl"]["data"],
+        file_name=st.session_state["last_stl"]["filename"],
+        mime="model/stl",
+    )
+
+st.caption("Powered by Overture2STL by Abiro 2026, licensed under the MIT License.")
